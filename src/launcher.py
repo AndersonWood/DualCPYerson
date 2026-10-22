@@ -41,7 +41,7 @@ from src.control_panel import show_loading_screen, CTkUI
 from src.device_profile_editor import DeviceProfileEditorDialog
 from src.win32_dock import Win32Dock, apply_docked_style, apply_undocked_style
 from src.device_detection import detect_device, resolve_adb, get_device_info, get_display_list
-from ui_constants import resource_path
+from src.ui_constants import resource_path
 
 logger = logging.getLogger(__name__)
 
