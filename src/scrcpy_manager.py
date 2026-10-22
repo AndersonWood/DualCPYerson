@@ -465,6 +465,7 @@ class ScrcpyManager:
             self.f_h1,
             extra_args=top_args,
             max_fps_override=self.max_fps,
+            stream_width=max(self.f_w1, profile.top_screen_width),
         )
 
         # Wait for first display to stabilize
@@ -497,6 +498,7 @@ class ScrcpyManager:
             self.f_w2,
             self.f_h2,
             extra_args=bottom_args,
+            stream_width=max(self.f_w2, profile.bottom_screen_width),
         )
 
         logger.info("All scrcpy windows started successfully")
@@ -511,6 +513,7 @@ class ScrcpyManager:
             height,
             extra_args: list = None,
             max_fps_override=None,
+            stream_width=None,
     ):
         """
         Start a single scrcpy window with retry logic.
@@ -526,7 +529,11 @@ class ScrcpyManager:
             "--serial",       serial,
             "--display-id",   display_id,
             "--window-title", window_title,
-            "--max-size",     f"{width}",
+            # Stream at the screen's full resolution so fullscreen stays sharp; the
+            # on-screen window is still sized to width x height.
+            "--max-size",     f"{stream_width or width}",
+            "--window-width", f"{width}",
+            "--window-height", f"{height}",
             "--max-fps",      str(max_fps_override if max_fps_override is not None else self.max_fps),
             *(extra_args or []),
         ]

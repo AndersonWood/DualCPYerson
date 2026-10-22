@@ -72,6 +72,12 @@ GWL_STYLE = -16
 SWP_NOZORDER = 0x0004
 SWP_FRAMECHANGED = 0x0020
 SWP_SHOWWINDOW = 0x0040
+WS_POPUP = 0x80000000
+WS_EX_TOPMOST = 0x00000008
+WS_EX_TOOLWINDOW = 0x00000080
+WS_EX_NOACTIVATE = 0x08000000
+HWND_TOPMOST = -1
+HWND_NOTOPMOST = -2
 MONITOR_DEFAULTTONEAREST = 2
 
 # Process creation flags
@@ -149,7 +155,7 @@ class Launcher:
         self.docked = True
         self.fullscreen = False
         self._fs_restore = None
-        self._fs_windows = {}   # undocked per-window fullscreen: hwnd -> (style, x, y, w, h)
+        self._fs_windows = {}   # undocked per-window fullscreen: hwnd -> (style, x, y, w, h, backdrop_hwnd)
         self._f11_was_down = False
         self.hwnd_container = None
         self._wndproc = None
@@ -330,20 +336,61 @@ class Launcher:
         r = mi.rcMonitor
         return r.left, r.top, r.right - r.left, r.bottom - r.top
 
+    def _create_backdrop(self, x, y, w, h):
+        """A plain black topmost window covering a monitor, so any bars around a fullscreen screen are true black."""
+        try:
+            if not getattr(self, "_backdrop_class_ready", False):
+                class WNDCLASSEX(ctypes.Structure):
+                    _fields_ = [
+                        ("cbSize", wintypes.UINT), ("style", wintypes.UINT),
+                        ("lpfnWndProc", ctypes.c_void_p), ("cbClsExtra", ctypes.c_int),
+                        ("cbWndExtra", ctypes.c_int), ("hInstance", wintypes.HINSTANCE),
+                        ("hIcon", wintypes.HANDLE), ("hCursor", wintypes.HANDLE),
+                        ("hbrBackground", wintypes.HANDLE), ("lpszMenuName", wintypes.LPCWSTR),
+                        ("lpszClassName", wintypes.LPCWSTR), ("hIconSm", wintypes.HANDLE),
+                    ]
+                wc = WNDCLASSEX()
+                wc.cbSize = ctypes.sizeof(WNDCLASSEX)
+                wc.lpfnWndProc = ctypes.cast(self.user32.DefWindowProcW, ctypes.c_void_p).value
+                wc.lpszClassName = "DualCPYBackdrop"
+                wc.hInstance = self.kernel32.GetModuleHandleW(None)
+                wc.hbrBackground = ctypes.windll.gdi32.GetStockObject(BLACK_BRUSH)
+                self.user32.RegisterClassExW(ctypes.byref(wc))
+                self._backdrop_class_ready = True
+
+            hinst = self.kernel32.GetModuleHandleW(None)
+            hb = self.user32.CreateWindowExW(
+                WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
+                "DualCPYBackdrop", "", ctypes.c_uint(WS_POPUP | WS_VISIBLE),
+                x, y, w, h, None, 0, ctypes.c_void_p(hinst), None,
+            )
+            if hb:
+                self.user32.SetWindowPos(
+                    hb, ctypes.c_void_p(HWND_TOPMOST), x, y, w, h, SWP_SHOWWINDOW | 0x0010
+                )
+            return hb or None
+        except Exception as e:
+            logger.error(f"Could not create black backdrop: {e}", exc_info=True)
+            return None
+
     def toggle_window_fullscreen(self, hwnd):
         """
         Undocked F11: put one scrcpy window (top or bottom) fullscreen on whichever monitor
-        it is on, or restore it. scrcpy keeps the aspect ratio and fills the rest with black.
+        it is on, or restore it. The screen is fitted to the monitor at its own aspect ratio
+        on a black backdrop, so the bars around it are always true black.
         """
         if not hwnd or not self.user32.IsWindow(hwnd):
             return
         try:
             if hwnd in self._fs_windows:
-                style, x, y, w, h = self._fs_windows.pop(hwnd)
+                style, x, y, w, h, backdrop = self._fs_windows.pop(hwnd)
                 self.dock.fs_hwnds.discard(hwnd)
+                if backdrop and self.user32.IsWindow(backdrop):
+                    self.user32.DestroyWindow(backdrop)
                 self.user32.SetWindowLongW(hwnd, GWL_STYLE, style)
                 self.user32.SetWindowPos(
-                    hwnd, 0, x, y, w, h, SWP_NOZORDER | SWP_FRAMECHANGED | SWP_SHOWWINDOW
+                    hwnd, ctypes.c_void_p(HWND_NOTOPMOST), x, y, w, h,
+                    SWP_FRAMECHANGED | SWP_SHOWWINDOW,
                 )
                 logger.info(f"Window {hwnd} left fullscreen")
                 return
@@ -356,19 +403,30 @@ class Launcher:
 
             rect = wintypes.RECT()
             self.user32.GetWindowRect(hwnd, ctypes.byref(rect))
+            crect = wintypes.RECT()
+            self.user32.GetClientRect(hwnd, ctypes.byref(crect))
+            cw, ch = max(crect.right, 1), max(crect.bottom, 1)
             style = self.user32.GetWindowLongW(hwnd, GWL_STYLE)
+
+            # Fit the screen's own aspect ratio inside the monitor and centre it
+            fit = min(mw / cw, mh / ch)
+            fw, fh = round(cw * fit), round(ch * fit)
+            fx, fy = mx + (mw - fw) // 2, my + (mh - fh) // 2
+
+            backdrop = self._create_backdrop(mx, my, mw, mh)
             self._fs_windows[hwnd] = (
                 style, rect.left, rect.top,
-                rect.right - rect.left, rect.bottom - rect.top,
+                rect.right - rect.left, rect.bottom - rect.top, backdrop,
             )
             self.dock.fs_hwnds.add(hwnd)
 
             self.user32.SetWindowLongW(hwnd, GWL_STYLE, (style & ~WS_OVERLAPPEDWINDOW) | WS_VISIBLE)
             self.user32.SetWindowPos(
-                hwnd, 0, mx, my, mw, mh, SWP_FRAMECHANGED | SWP_SHOWWINDOW
+                hwnd, ctypes.c_void_p(HWND_TOPMOST), fx, fy, fw, fh,
+                SWP_FRAMECHANGED | SWP_SHOWWINDOW,
             )
             self.user32.SetForegroundWindow(hwnd)
-            logger.info(f"Window {hwnd} fullscreen on monitor {mw}x{mh} at ({mx},{my})")
+            logger.info(f"Window {hwnd} fullscreen on {mw}x{mh} monitor at ({mx},{my}), content {fw}x{fh}")
         except Exception as e:
             logger.error(f"Window fullscreen toggle failed: {e}", exc_info=True)
             self._fs_windows.pop(hwnd, None)
@@ -443,6 +501,14 @@ class Launcher:
         key presses, so F11 is detected by polling the key state while one of our windows has focus.
         """
         try:
+            # Drop the black backdrop of any fullscreen window that was closed
+            for hwnd in list(self._fs_windows):
+                if not self.user32.IsWindow(hwnd):
+                    backdrop = self._fs_windows.pop(hwnd)[5]
+                    self.dock.fs_hwnds.discard(hwnd)
+                    if backdrop and self.user32.IsWindow(backdrop):
+                        self.user32.DestroyWindow(backdrop)
+
             down = bool(self.user32.GetAsyncKeyState(VK_F11) & 0x8000)
             pressed = down and not self._f11_was_down
             self._f11_was_down = down
@@ -463,10 +529,6 @@ class Launcher:
                 self.toggle_fullscreen()
             else:
                 # Undocked: fullscreen whichever scrcpy window has focus
-                for hwnd in list(self._fs_windows):
-                    if not self.user32.IsWindow(hwnd):
-                        self._fs_windows.pop(hwnd, None)
-                        self.dock.fs_hwnds.discard(hwnd)
                 if fg and fg in (self.dock.hwnd_top, self.dock.hwnd_bottom):
                     self.toggle_window_fullscreen(fg)
         except Exception as e:
