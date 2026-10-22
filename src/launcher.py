@@ -66,6 +66,14 @@ SW_SHOW = 5
 # GDI constants
 BLACK_BRUSH = 4
 
+# Fullscreen (F11) constants
+VK_F11 = 0x7A
+GWL_STYLE = -16
+SWP_NOZORDER = 0x0004
+SWP_FRAMECHANGED = 0x0020
+SWP_SHOWWINDOW = 0x0040
+MONITOR_DEFAULTTONEAREST = 2
+
 # Process creation flags
 CREATE_NO_WINDOW = 0x08000000
 
@@ -139,6 +147,10 @@ class Launcher:
         self.dock = Win32Dock()
         self.running = False
         self.docked = True
+        self.fullscreen = False
+        self._fs_restore = None
+        self._fs_windows = {}   # undocked per-window fullscreen: hwnd -> (style, x, y, w, h)
+        self._f11_was_down = False
         self.hwnd_container = None
         self._wndproc = None
         self.dock_lock = threading.Lock()
@@ -268,6 +280,198 @@ class Launcher:
         except Exception as e:
             logger.error(f"Failed to save scale: {e}")
 
+    def _to_layout(self, x, y):
+        """Map container client coordinates back to layout coordinates (undoes the fullscreen scaling)."""
+        view = self.dock.view
+        if not view:
+            return x, y
+        sc, ox, oy, minx, miny = view
+        return (x - ox) / sc + minx, (y - oy) / sc + miny
+
+    def _layout_bounds(self):
+        """Bounding box of both screens in layout coordinates: (min_x, min_y, width, height)."""
+        minx = min(self.tx, self.bx)
+        miny = min(self.ty, self.by)
+        maxx = max(self.tx + self.scrcpy.f_w1, self.bx + self.scrcpy.f_w2)
+        maxy = max(self.ty + self.scrcpy.f_h1, self.by + self.scrcpy.f_h2)
+        return minx, miny, maxx - minx, maxy - miny
+
+    def toggle_fullscreen(self):
+        """F11: borderless fullscreen on the current monitor, black background, screens centred and scaled to fit."""
+        if not self.hwnd_container or not self.docked or not self.dock.hwnd_top:
+            logger.info("Fullscreen ignored: must be docked with windows available")
+            return
+        with self.dock_lock:
+            if self.fullscreen:
+                self._exit_fullscreen()
+            else:
+                self._enter_fullscreen()
+
+    def _monitor_rect(self, hwnd):
+        """Full rectangle (x, y, w, h) of the monitor the window is mostly on, or None."""
+        class MONITORINFO(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", wintypes.DWORD),
+                ("rcMonitor", wintypes.RECT),
+                ("rcWork", wintypes.RECT),
+                ("dwFlags", wintypes.DWORD),
+            ]
+
+        self.user32.MonitorFromWindow.argtypes = [wintypes.HWND, wintypes.DWORD]
+        self.user32.MonitorFromWindow.restype = ctypes.c_void_p
+        self.user32.GetMonitorInfoW.argtypes = [ctypes.c_void_p, ctypes.POINTER(MONITORINFO)]
+        self.user32.GetMonitorInfoW.restype = wintypes.BOOL
+
+        hmon = self.user32.MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
+        mi = MONITORINFO()
+        mi.cbSize = ctypes.sizeof(MONITORINFO)
+        if not hmon or not self.user32.GetMonitorInfoW(hmon, ctypes.byref(mi)):
+            return None
+        r = mi.rcMonitor
+        return r.left, r.top, r.right - r.left, r.bottom - r.top
+
+    def toggle_window_fullscreen(self, hwnd):
+        """
+        Undocked F11: put one scrcpy window (top or bottom) fullscreen on whichever monitor
+        it is on, or restore it. scrcpy keeps the aspect ratio and fills the rest with black.
+        """
+        if not hwnd or not self.user32.IsWindow(hwnd):
+            return
+        try:
+            if hwnd in self._fs_windows:
+                style, x, y, w, h = self._fs_windows.pop(hwnd)
+                self.dock.fs_hwnds.discard(hwnd)
+                self.user32.SetWindowLongW(hwnd, GWL_STYLE, style)
+                self.user32.SetWindowPos(
+                    hwnd, 0, x, y, w, h, SWP_NOZORDER | SWP_FRAMECHANGED | SWP_SHOWWINDOW
+                )
+                logger.info(f"Window {hwnd} left fullscreen")
+                return
+
+            mon = self._monitor_rect(hwnd)
+            if not mon:
+                logger.error("Could not read monitor info, window fullscreen cancelled")
+                return
+            mx, my, mw, mh = mon
+
+            rect = wintypes.RECT()
+            self.user32.GetWindowRect(hwnd, ctypes.byref(rect))
+            style = self.user32.GetWindowLongW(hwnd, GWL_STYLE)
+            self._fs_windows[hwnd] = (
+                style, rect.left, rect.top,
+                rect.right - rect.left, rect.bottom - rect.top,
+            )
+            self.dock.fs_hwnds.add(hwnd)
+
+            self.user32.SetWindowLongW(hwnd, GWL_STYLE, (style & ~WS_OVERLAPPEDWINDOW) | WS_VISIBLE)
+            self.user32.SetWindowPos(
+                hwnd, 0, mx, my, mw, mh, SWP_FRAMECHANGED | SWP_SHOWWINDOW
+            )
+            self.user32.SetForegroundWindow(hwnd)
+            logger.info(f"Window {hwnd} fullscreen on monitor {mw}x{mh} at ({mx},{my})")
+        except Exception as e:
+            logger.error(f"Window fullscreen toggle failed: {e}", exc_info=True)
+            self._fs_windows.pop(hwnd, None)
+            self.dock.fs_hwnds.discard(hwnd)
+
+    def _restore_all_window_fullscreen(self):
+        """Put any fullscreen undocked windows back to normal (used before re-docking)."""
+        for hwnd in list(self._fs_windows):
+            self.toggle_window_fullscreen(hwnd)
+
+    def _enter_fullscreen(self):
+        hwnd = self.hwnd_container
+        try:
+            mon = self._monitor_rect(hwnd)
+            if not mon:
+                logger.error("Could not read monitor info, fullscreen cancelled")
+                return
+            mx, my, mw, mh = mon
+
+            # Remember where the window was so F11 can put it back
+            rect = wintypes.RECT()
+            self.user32.GetWindowRect(hwnd, ctypes.byref(rect))
+            style = self.user32.GetWindowLongW(hwnd, GWL_STYLE)
+            self._fs_restore = (
+                style, rect.left, rect.top,
+                rect.right - rect.left, rect.bottom - rect.top,
+            )
+
+            # Fit and centre both screens inside the monitor
+            minx, miny, lw, lh = self._layout_bounds()
+            scale = min(mw / lw, mh / lh)
+            off_x = (mw - lw * scale) / 2
+            off_y = (mh - lh * scale) / 2
+            self.dock.view = (scale, off_x, off_y, minx, miny)
+            self.dock.invalidate_geom_cache()
+
+            # Borderless, covering the whole monitor (the class brush paints it black)
+            self.user32.SetWindowLongW(hwnd, GWL_STYLE, (style & ~WS_OVERLAPPEDWINDOW) | WS_VISIBLE)
+            self.user32.SetWindowPos(
+                hwnd, 0, mx, my, mw, mh, SWP_FRAMECHANGED | SWP_SHOWWINDOW
+            )
+            self.user32.InvalidateRect(hwnd, None, True)
+            self.user32.SetForegroundWindow(hwnd)
+            self.fullscreen = True
+            logger.info(f"Entered fullscreen: {mw}x{mh}, scale {scale:.3f}")
+        except Exception as e:
+            logger.error(f"Failed to enter fullscreen: {e}", exc_info=True)
+            self.dock.view = None
+
+    def _exit_fullscreen(self):
+        """Leave fullscreen. Caller must hold dock_lock."""
+        hwnd = self.hwnd_container
+        try:
+            self.dock.view = None
+            self.dock.invalidate_geom_cache()
+            if self._fs_restore and hwnd:
+                style, x, y, w, h = self._fs_restore
+                self.user32.SetWindowLongW(hwnd, GWL_STYLE, style)
+                self.user32.SetWindowPos(
+                    hwnd, 0, x, y, w, h, SWP_NOZORDER | SWP_FRAMECHANGED | SWP_SHOWWINDOW
+                )
+                self.user32.InvalidateRect(hwnd, None, True)
+            logger.info("Left fullscreen")
+        except Exception as e:
+            logger.error(f"Failed to leave fullscreen: {e}", exc_info=True)
+        finally:
+            self.fullscreen = False
+
+    def poll_fullscreen_hotkey(self):
+        """
+        Called from the UI loop. scrcpy's SDL windows live in another process and swallow
+        key presses, so F11 is detected by polling the key state while one of our windows has focus.
+        """
+        try:
+            down = bool(self.user32.GetAsyncKeyState(VK_F11) & 0x8000)
+            pressed = down and not self._f11_was_down
+            self._f11_was_down = down
+            if not pressed:
+                return
+
+            fg = self.user32.GetForegroundWindow()
+            pid = wintypes.DWORD(0)
+            self.user32.GetWindowThreadProcessId(fg, ctypes.byref(pid))
+            ours = (
+                pid.value == os.getpid()
+                or fg in (self.hwnd_container, self.dock.hwnd_top, self.dock.hwnd_bottom)
+            )
+            if not ours:
+                return
+
+            if self.docked:
+                self.toggle_fullscreen()
+            else:
+                # Undocked: fullscreen whichever scrcpy window has focus
+                for hwnd in list(self._fs_windows):
+                    if not self.user32.IsWindow(hwnd):
+                        self._fs_windows.pop(hwnd, None)
+                        self.dock.fs_hwnds.discard(hwnd)
+                if fg and fg in (self.dock.hwnd_top, self.dock.hwnd_bottom):
+                    self.toggle_window_fullscreen(fg)
+        except Exception as e:
+            logger.debug(f"F11 poll error: {e}")
+
     def _create_wnd_proc(self):
         WM_LBUTTONDOWN = 0x0201
         WM_PARENTNOTIFY = 0x0210
@@ -287,21 +491,21 @@ class Launcher:
                 pt = wintypes.POINT()
                 self.user32.GetCursorPos(ctypes.byref(pt))
                 self.user32.ScreenToClient(hwnd, ctypes.byref(pt))
+                px, py = self._to_layout(pt.x, pt.y)
 
                 # Check if mouse is over top or bottom screen and force focus
-                if (self.tx <= pt.x <= self.tx + self.scrcpy.f_w1 and
-                        self.ty <= pt.y <= self.ty + self.scrcpy.f_h1):
+                if (self.tx <= px <= self.tx + self.scrcpy.f_w1 and
+                        self.ty <= py <= self.ty + self.scrcpy.f_h1):
                     self.dock.force_focus(self.dock.hwnd_top)
-                elif (self.bx <= pt.x <= self.bx + self.scrcpy.f_w2 and
-                      self.by <= pt.y <= self.by + self.scrcpy.f_h2):
+                elif (self.bx <= px <= self.bx + self.scrcpy.f_w2 and
+                      self.by <= py <= self.by + self.scrcpy.f_h2):
                     self.dock.force_focus(self.dock.hwnd_bottom)
                 return MA_ACTIVATE
 
             # This is the ONLY place focus should be handled
             if msg == WM_PARENTNOTIFY:
                 if (wp & 0xFFFF) == WM_LBUTTONDOWN:
-                    mx = lp & 0xFFFF
-                    my = (lp >> 16) & 0xFFFF
+                    mx, my = self._to_layout(lp & 0xFFFF, (lp >> 16) & 0xFFFF)
 
                     if (self.tx <= mx <= self.tx + self.scrcpy.f_w1 and
                             self.ty <= my <= self.ty + self.scrcpy.f_h1):
@@ -597,6 +801,8 @@ class Launcher:
             if self.docked:
                 # Undock windows
                 logger.info("Undocking windows")
+                if self.fullscreen:
+                    self._exit_fullscreen()
                 self.docked = False
 
                 apply_undocked_style(self.dock.hwnd_top)
@@ -608,6 +814,7 @@ class Launcher:
             else:
                 # Dock windows in a container
                 logger.info("Docking windows")
+                self._restore_all_window_fullscreen()
                 self.user32.ShowWindow(self.hwnd_container, SW_SHOW)
 
                 top_title, bottom_title = self._window_titles

@@ -33,7 +33,7 @@ from ctypes import windll, wintypes
 from src.win32_darkmode import enable_dark_titlebar
 from src.file_transfer_dialog import FileTransferDialog
 from src.ui_constants import (
-    BG_COLOUR, PANEL_COLOUR, BORDER_COLOUR, TEXT_COLOUR,
+    BG_COLOUR, OLED_BLACK, PANEL_COLOUR, BORDER_COLOUR, TEXT_COLOUR,
     ACCENT_COLOUR, ACCENT2_COLOUR, TOP_COLOUR, BOTTOM_COLOUR,
     SUCCESS_COLOUR, DANGER_COLOUR, WARNING_COLOUR,
     CALSANS_FAMILY, ICON_PATH, FONT_PATH,
@@ -701,6 +701,16 @@ class CTkUI:
         if hasattr(self.l, "toggle_dock"):
             self.l.toggle_dock()
             self._dock_btn_text.set("Undock" if self.l.docked else "Dock")
+            self._apply_background()
+
+    def _apply_background(self):
+        """Pure OLED black while undocked, normal dark background while docked"""
+        colour = BG_COLOUR if self.l.docked else OLED_BLACK
+        if getattr(self, "_current_bg", None) == colour:
+            return
+        self._current_bg = colour
+        self.window.configure(fg_color=colour)
+        self._scroll.configure(fg_color=colour)
 
     def _on_wireless(self):
         """Hide CTK window, open wireless dialog, restore window."""
@@ -1061,10 +1071,14 @@ class CTkUI:
                     is_docked=self.l.docked,
                 )
 
+            # F11 fullscreen toggle
+            self.l.poll_fullscreen_hotkey()
+
             # Keep dock button label in sync with actual state
             expected = "Undock" if self.l.docked else "Dock"
             if self._dock_btn_text.get() != expected:
                 self._dock_btn_text.set(expected)
+            self._apply_background()
 
         except Exception as e:
             logger.error(f"Update loop error: {e}", exc_info=True)

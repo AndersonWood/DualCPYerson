@@ -29,6 +29,7 @@ logger = logging.getLogger(__name__)
 
 # Colours
 BG_COLOUR      = "#121418"
+OLED_BLACK     = "#000000"   # Pure black background used while undocked
 PANEL_COLOUR   = "#1e2128"
 BORDER_COLOUR  = "#2d3139"
 TEXT_COLOUR    = "#c8cdd8"

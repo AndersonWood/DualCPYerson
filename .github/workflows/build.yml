@@ -1,0 +1,31 @@
+name: Build Windows exe
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Build
+        run: |
+          New-Item -ItemType Directory -Force -Path logs | Out-Null
+          python build.py
+
+      - name: Upload build
+        uses: actions/upload-artifact@v4
+        with:
+          name: DualCPY-windows
+          path: dist/DualCPY

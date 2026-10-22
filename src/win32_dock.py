@@ -90,6 +90,11 @@ class Win32Dock:
         self._min_sync_interval = MIN_SYNC_INTERVAL
         self._last_top_geom = None
         self._last_bottom_geom = None
+        # Fullscreen view: None, or (scale, off_x, off_y, layout_min_x, layout_min_y).
+        # When set, docked geometry is scaled and centred inside the container.
+        self.view = None
+        # Undocked windows currently in their own fullscreen; sync() leaves these alone
+        self.fs_hwnds = set()
         logger.debug("Win32Dock initialized with null window handles")
 
     def sync(self, tx, ty, bx, by, w1, h1, w2, h2, is_docked=True):
@@ -114,6 +119,18 @@ class Win32Dock:
                 flags = SWP_NOZORDER | SWP_NOACTIVATE
                 top_geom = (int(tx), int(ty), int(w1), int(h1))
                 bottom_geom = (int(bx), int(by), int(w2), int(h2))
+
+                # Fullscreen: scale the whole layout to fit and centre it
+                if self.view:
+                    sc, ox, oy, minx, miny = self.view
+                    top_geom = (
+                        round(ox + (tx - minx) * sc), round(oy + (ty - miny) * sc),
+                        round(w1 * sc), round(h1 * sc),
+                    )
+                    bottom_geom = (
+                        round(ox + (bx - minx) * sc), round(oy + (by - miny) * sc),
+                        round(w2 * sc), round(h2 * sc),
+                    )
 
                 if top_geom != self._last_top_geom:
                     logger.debug(f"Syncing docked top: {top_geom}")
@@ -171,12 +188,12 @@ class Win32Dock:
                     bottom_geom = (x2_adj, y2_adj, w2_adj, h2_adj)
 
                     # Apply adjusted geometries
-                    if top_geom != self._last_top_geom:
+                    if top_geom != self._last_top_geom and self.hwnd_top not in self.fs_hwnds:
                         logger.debug(f"Syncing undocked top: {top_geom}")
                         user32.SetWindowPos(self.hwnd_top, 0, *top_geom, flags)
                         self._last_top_geom = top_geom
 
-                    if bottom_geom != self._last_bottom_geom:
+                    if bottom_geom != self._last_bottom_geom and self.hwnd_bottom not in self.fs_hwnds:
                         logger.debug(f"Syncing undocked bottom: {bottom_geom}")
                         user32.SetWindowPos(self.hwnd_bottom, 0, *bottom_geom, flags)
                         self._last_bottom_geom = bottom_geom
